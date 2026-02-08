@@ -139,12 +139,16 @@ const player = {
 const monster = {
   x: W - 90,
   y: H - 90,
-  w: 22,
-  h: 22,
-  speedChase: 175,
-  speedPatrol: 110,
+  w: 34,
+  h: 24,
+  speedChase: 160,
+  speedPatrol: 105,
   wander: { x: W / 2, y: H / 2, until: 0 },
+  breathCooldownMs: 550,
+  lastBreathAt: 0,
 };
+
+const flames = []; // dragon fire projectiles
 
 let startTs = 0;
 let lastTs = 0;
@@ -154,9 +158,11 @@ let state = 'running'; // running | won | lost
 function reset() {
   player.x = 60;
   player.y = 60;
-  monster.x = W - 90;
-  monster.y = H - 90;
+  monster.x = W - 110;
+  monster.y = H - 100;
   monster.wander = { x: W / 2, y: H / 2, until: 0 };
+  monster.lastBreathAt = 0;
+  flames.length = 0;
   startTs = 0;
   lastTs = 0;
   elapsed = 0;
@@ -211,6 +217,53 @@ function pickWanderTarget(now) {
   monster.wander.until = now + 1000;
 }
 
+function shootFlame(fromX, fromY, toX, toY, now) {
+  const v = norm(toX - fromX, toY - fromY);
+  const speed = 420;
+  flames.push({
+    x: fromX + v.x * 18,
+    y: fromY + v.y * 18,
+    vx: v.x * speed,
+    vy: v.y * speed,
+    r: 6,
+    bornAt: now,
+    ttlMs: 1400,
+  });
+}
+
+function updateFlames(dt, now) {
+  for (let i = flames.length - 1; i >= 0; i--) {
+    const f = flames[i];
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+
+    // expire
+    if (now - f.bornAt > f.ttlMs) {
+      flames.splice(i, 1);
+      continue;
+    }
+
+    // hit wall → extinguish
+    const fr = rect(f.x - f.r, f.y - f.r, f.r * 2, f.r * 2);
+    let hitWall = false;
+    for (const w of walls) {
+      if (intersectsAABB(fr, w)) { hitWall = true; break; }
+    }
+    if (hitWall) {
+      flames.splice(i, 1);
+      continue;
+    }
+
+    // hit player
+    const pr = rect(player.x, player.y, player.w, player.h);
+    if (pointInRect(f.x, f.y, pr) || intersectsAABB(fr, pr)) {
+      state = 'lost';
+      statusEl.textContent = 'burned (press R)';
+      flames.splice(i, 1);
+    }
+  }
+}
+
 function updateMonster(dt, now) {
   const pcx = player.x + player.w / 2;
   const pcy = player.y + player.h / 2;
@@ -220,22 +273,136 @@ function updateMonster(dt, now) {
   const sees = hasLineOfSight(mcx, mcy, pcx, pcy);
 
   if (sees) {
-    const v = norm(pcx - mcx, pcy - mcy);
-    moveEntity(monster, v.x * monster.speedChase, v.y * monster.speedChase, dt);
+    // keep some distance; the dragon attacks with flames
+    const dist = len(pcx - mcx, pcy - mcy);
+    if (dist > 120) {
+      const v = norm(pcx - mcx, pcy - mcy);
+      moveEntity(monster, v.x * monster.speedChase, v.y * monster.speedChase, dt);
+    }
+
+    if (now - monster.lastBreathAt >= monster.breathCooldownMs) {
+      monster.lastBreathAt = now;
+      shootFlame(mcx, mcy, pcx, pcy, now);
+    }
   } else {
     if (now > monster.wander.until) pickWanderTarget(now);
     const v = norm(monster.wander.x - mcx, monster.wander.y - mcy);
     moveEntity(monster, v.x * monster.speedPatrol, v.y * monster.speedPatrol, dt);
   }
 
-  // lose condition: touching
+  // lose condition: touching (still bad)
   if (intersectsAABB(player, monster)) {
     state = 'lost';
-    statusEl.textContent = 'lost (press R)';
+    statusEl.textContent = 'mauled (press R)';
   }
 }
 
-function draw() {
+function drawStickFigure(x, y) {
+  // stick figure centered in player rect
+  const cx = x + player.w / 2;
+  const top = y + 2;
+  const headR = 5;
+
+  ctx.save();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#e9ecff';
+
+  // head
+  ctx.beginPath();
+  ctx.arc(cx, top + headR, headR, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // body
+  const neckY = top + headR * 2 + 1;
+  const hipY = y + player.h - 3;
+  ctx.beginPath();
+  ctx.moveTo(cx, neckY);
+  ctx.lineTo(cx, hipY);
+  ctx.stroke();
+
+  // arms
+  const armY = neckY + 6;
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, armY);
+  ctx.lineTo(cx + 7, armY);
+  ctx.stroke();
+
+  // legs
+  ctx.beginPath();
+  ctx.moveTo(cx, hipY);
+  ctx.lineTo(cx - 6, hipY + 9);
+  ctx.moveTo(cx, hipY);
+  ctx.lineTo(cx + 6, hipY + 9);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawDragon(x, y) {
+  // simple dragon silhouette within monster rect
+  const cx = x + monster.w / 2;
+  const cy = y + monster.h / 2;
+
+  ctx.save();
+
+  // body
+  ctx.fillStyle = '#ff4d4d';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 2, 14, 9, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // head
+  ctx.beginPath();
+  ctx.ellipse(cx + 14, cy - 3, 7, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // wing
+  ctx.fillStyle = 'rgba(255,77,77,0.8)';
+  ctx.beginPath();
+  ctx.moveTo(cx - 4, cy - 2);
+  ctx.lineTo(cx - 18, cy - 16);
+  ctx.lineTo(cx - 14, cy + 4);
+  ctx.closePath();
+  ctx.fill();
+
+  // eye
+  ctx.fillStyle = '#111';
+  ctx.beginPath();
+  ctx.arc(cx + 16, cy - 4, 1.6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // outline
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 0.5, y + 0.5, monster.w - 1, monster.h - 1);
+
+  ctx.restore();
+}
+
+function drawFlames(now) {
+  for (const f of flames) {
+    const age = clamp((now - f.bornAt) / f.ttlMs, 0, 1);
+    const r = f.r * (1.15 - age * 0.35);
+
+    ctx.save();
+    const grad = ctx.createRadialGradient(f.x, f.y, 1, f.x, f.y, r * 2.2);
+    grad.addColorStop(0, 'rgba(255,255,200,0.95)');
+    grad.addColorStop(0.35, 'rgba(255,170,0,0.85)');
+    grad.addColorStop(1, 'rgba(255,60,0,0.0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, r * 2.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,120,0,0.9)';
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function draw(now) {
   ctx.clearRect(0, 0, W, H);
 
   // background grid
@@ -272,8 +439,8 @@ function draw() {
   const sees = hasLineOfSight(mcx, mcy, pcx, pcy);
 
   ctx.save();
-  ctx.globalAlpha = sees ? 0.25 : 0.10;
-  ctx.strokeStyle = sees ? '#ff5b5b' : '#9aa6ff';
+  ctx.globalAlpha = sees ? 0.22 : 0.08;
+  ctx.strokeStyle = sees ? '#ff8a3d' : '#9aa6ff';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(mcx, mcy);
@@ -281,17 +448,14 @@ function draw() {
   ctx.stroke();
   ctx.restore();
 
-  // player
-  ctx.fillStyle = '#4da3ff';
-  ctx.fillRect(player.x, player.y, player.w, player.h);
-  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-  ctx.strokeRect(player.x + 0.5, player.y + 0.5, player.w - 1, player.h - 1);
+  // flames
+  drawFlames(now);
 
-  // monster
-  ctx.fillStyle = '#ff4d4d';
-  ctx.fillRect(monster.x, monster.y, monster.w, monster.h);
-  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-  ctx.strokeRect(monster.x + 0.5, monster.y + 0.5, monster.w - 1, monster.h - 1);
+  // player (stick figure)
+  drawStickFigure(player.x, player.y);
+
+  // monster (dragon)
+  drawDragon(monster.x, monster.y);
 
   // text overlays
   if (state !== 'running') {
@@ -321,6 +485,7 @@ function tick(ts) {
 
     updatePlayer(dt);
     updateMonster(dt, ts);
+    updateFlames(dt, ts);
 
     if (elapsed >= GOAL_SECONDS) {
       state = 'won';
@@ -328,7 +493,7 @@ function tick(ts) {
     }
   }
 
-  draw();
+  draw(ts);
   requestAnimationFrame(tick);
 }
 
