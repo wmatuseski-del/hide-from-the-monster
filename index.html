@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hide From The Monster</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>Hide From The Monster</h1>
+        <p>
+          Move with <b>arrow keys</b> (or WASD). Hide behind walls to break line of sight.
+          <br />
+          Survive <b id="goal">30</b>s. Press <b>R</b> to restart.
+        </p>
+      </header>
+
+      <canvas id="game" width="900" height="520" aria-label="game canvas"></canvas>
+
+      <footer>
+        <div class="hud">
+          <div>Status: <span id="status">running</span></div>
+          <div>Time: <span id="time">0.0</span>s</div>
+        </div>
+      </footer>
+    </div>
+
+    <script src="game.js"></script>
+  </body>
+</html>
