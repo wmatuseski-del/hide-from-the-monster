@@ -1,8 +1,14 @@
 /*
   Hide From The Monster
   - Canvas + simple collision
-  - Dragon chases if it has line-of-sight (LOS), otherwise patrols
-  - Walls block LOS and flame breath
+  - Dragon uses grid A* pathfinding to reach the stick figure efficiently
+  - Walls block line-of-sight (LOS) and flame breath
+
+  Controls:
+  - Move: arrows / WASD
+  - Sprint: Shift (stamina)
+  - Shield: hold Space (durability)
+  - Restart: R
 */
 
 const canvas = document.getElementById('game');
@@ -21,7 +27,7 @@ goalEl.textContent = String(GOAL_SECONDS);
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
-  if (['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d','r','shift',' '].includes(k)) {
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'w', 'a', 's', 'd', 'r', 'shift', ' '].includes(k)) {
     e.preventDefault();
   }
   keys.add(k);
@@ -149,57 +155,223 @@ const monster = {
   y: H - 100,
   w: 34,
   h: 24,
-  speedChase: 220, // faster
+  speedChase: 235,
   speedPatrol: 125,
   wander: { x: W / 2, y: H / 2, until: 0 },
+
+  // pathfinding
+  path: [],
+  pathIdx: 0,
+  nextPathAt: 0,
+  lastTargetKey: null,
+  lastSeen: { x: W / 2, y: H / 2, at: 0 },
 
   // flame breath
   breathCooldownMs: 900,
   breathDurationMs: 700,
   breathActiveUntil: 0,
   lastBreathAt: 0,
-  coneAngle: Math.PI / 5.5, // total cone width ~33deg
+  coneAngle: Math.PI / 5.5,
 };
 
 // flame particles
 const flames = [];
 
-let startTs = 0;
-let lastTs = 0;
-let elapsed = 0;
-let state = 'running';
+// --- Grid nav (A*) ---
+const NAV_CELL = 22; // smaller = smarter but heavier; this is a good sweet spot
+const NAV_COLS = Math.floor(W / NAV_CELL);
+const NAV_ROWS = Math.floor(H / NAV_CELL);
+let navBlocked = null; // Uint8Array(NAV_COLS*NAV_ROWS)
 
-function reset() {
-  player.x = 60;
-  player.y = 60;
-  player.stamina = player.staminaMax;
-  player.shield.active = false;
-  player.shield.durability = player.shield.max;
-  player.shield.brokenUntil = 0;
+function navIdx(c, r) { return r * NAV_COLS + c; }
+function inBounds(c, r) { return c >= 0 && r >= 0 && c < NAV_COLS && r < NAV_ROWS; }
 
-  monster.x = W - 110;
-  monster.y = H - 100;
-  monster.wander = { x: W / 2, y: H / 2, until: 0 };
-  monster.breathActiveUntil = 0;
-  monster.lastBreathAt = 0;
+function rebuildNavGrid() {
+  navBlocked = new Uint8Array(NAV_COLS * NAV_ROWS);
 
-  flames.length = 0;
-  startTs = 0;
-  lastTs = 0;
-  elapsed = 0;
-  state = 'running';
-  statusEl.textContent = 'running';
+  // Inflate walls a bit so the dragon doesn't plan paths that scrape walls.
+  const inflate = 10;
+  const inflatedWalls = walls.map(w => rect(w.x - inflate, w.y - inflate, w.w + inflate * 2, w.h + inflate * 2));
+
+  for (let r = 0; r < NAV_ROWS; r++) {
+    for (let c = 0; c < NAV_COLS; c++) {
+      const cx = c * NAV_CELL + NAV_CELL / 2;
+      const cy = r * NAV_CELL + NAV_CELL / 2;
+      const probe = rect(cx - 2, cy - 2, 4, 4);
+
+      let blocked = false;
+      for (const w of inflatedWalls) {
+        if (intersectsAABB(probe, w)) { blocked = true; break; }
+      }
+      navBlocked[navIdx(c, r)] = blocked ? 1 : 0;
+    }
+  }
+}
+rebuildNavGrid();
+
+function pointToCell(x, y) {
+  const c = clamp(Math.floor(x / NAV_CELL), 0, NAV_COLS - 1);
+  const r = clamp(Math.floor(y / NAV_CELL), 0, NAV_ROWS - 1);
+  return { c, r, key: `${c},${r}` };
 }
 
-function moveEntity(ent, vx, vy, dt) {
-  ent.x += vx * dt;
-  ent.y += vy * dt;
-
-  for (const w of walls) resolveStaticCollision(ent, w);
-
-  ent.x = clamp(ent.x, 0, W - ent.w);
-  ent.y = clamp(ent.y, 0, H - ent.h);
+function cellCenter(c, r) {
+  return { x: c * NAV_CELL + NAV_CELL / 2, y: r * NAV_CELL + NAV_CELL / 2 };
 }
+
+function isBlocked(c, r) {
+  if (!inBounds(c, r)) return true;
+  return navBlocked[navIdx(c, r)] === 1;
+}
+
+function aStar(start, goal) {
+  // Basic A* (4-neighbor) for stability in tight corridors
+  const startIdx = navIdx(start.c, start.r);
+  const goalIdx = navIdx(goal.c, goal.r);
+
+  const gScore = new Float32Array(NAV_COLS * NAV_ROWS);
+  const fScore = new Float32Array(NAV_COLS * NAV_ROWS);
+  const cameFrom = new Int32Array(NAV_COLS * NAV_ROWS);
+  const inOpen = new Uint8Array(NAV_COLS * NAV_ROWS);
+  const inClosed = new Uint8Array(NAV_COLS * NAV_ROWS);
+
+  for (let i = 0; i < gScore.length; i++) {
+    gScore[i] = 1e9;
+    fScore[i] = 1e9;
+    cameFrom[i] = -1;
+  }
+
+  function h(c, r) {
+    // manhattan
+    return Math.abs(c - goal.c) + Math.abs(r - goal.r);
+  }
+
+  const openList = [];
+  gScore[startIdx] = 0;
+  fScore[startIdx] = h(start.c, start.r);
+  openList.push(startIdx);
+  inOpen[startIdx] = 1;
+
+  const dirs = [
+    { dc: 1, dr: 0 },
+    { dc: -1, dr: 0 },
+    { dc: 0, dr: 1 },
+    { dc: 0, dr: -1 },
+  ];
+
+  while (openList.length) {
+    // find best fScore (small lists, so linear scan is fine)
+    let bestI = 0;
+    for (let i = 1; i < openList.length; i++) {
+      if (fScore[openList[i]] < fScore[openList[bestI]]) bestI = i;
+    }
+    const currentIdx = openList.splice(bestI, 1)[0];
+    inOpen[currentIdx] = 0;
+    inClosed[currentIdx] = 1;
+
+    if (currentIdx === goalIdx) {
+      // reconstruct
+      const path = [];
+      let cur = currentIdx;
+      while (cur !== -1) {
+        const r = Math.floor(cur / NAV_COLS);
+        const c = cur - r * NAV_COLS;
+        path.push({ c, r });
+        cur = cameFrom[cur];
+      }
+      path.reverse();
+      return path;
+    }
+
+    const cr = Math.floor(currentIdx / NAV_COLS);
+    const cc = currentIdx - cr * NAV_COLS;
+
+    for (const d of dirs) {
+      const nc = cc + d.dc;
+      const nr = cr + d.dr;
+      if (!inBounds(nc, nr)) continue;
+      if (isBlocked(nc, nr)) continue;
+
+      const ni = navIdx(nc, nr);
+      if (inClosed[ni]) continue;
+
+      const tentative = gScore[currentIdx] + 1;
+      if (tentative < gScore[ni]) {
+        cameFrom[ni] = currentIdx;
+        gScore[ni] = tentative;
+        fScore[ni] = tentative + h(nc, nr);
+        if (!inOpen[ni]) {
+          openList.push(ni);
+          inOpen[ni] = 1;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function buildPathTo(targetX, targetY) {
+  const mc = pointToCell(monster.x + monster.w / 2, monster.y + monster.h / 2);
+  const tc = pointToCell(targetX, targetY);
+
+  // If target cell blocked (can happen near inflated borders), nudge around.
+  if (isBlocked(tc.c, tc.r)) {
+    // find nearest unblocked in a small radius
+    let found = null;
+    for (let rad = 1; rad <= 4 && !found; rad++) {
+      for (let dr = -rad; dr <= rad; dr++) {
+        for (let dc = -rad; dc <= rad; dc++) {
+          const c = tc.c + dc;
+          const r = tc.r + dr;
+          if (!inBounds(c, r)) continue;
+          if (!isBlocked(c, r)) { found = { c, r }; break; }
+        }
+        if (found) break;
+      }
+    }
+    if (found) {
+      tc.c = found.c;
+      tc.r = found.r;
+      tc.key = `${found.c},${found.r}`;
+    }
+  }
+
+  const startBlocked = isBlocked(mc.c, mc.r);
+  const goalBlocked = isBlocked(tc.c, tc.r);
+  if (startBlocked || goalBlocked) return false;
+
+  const cells = aStar(mc, tc);
+  if (!cells || cells.length < 2) return false;
+
+  // Convert to waypoints (skip the starting cell)
+  monster.path = cells.slice(1).map(p => cellCenter(p.c, p.r));
+  monster.pathIdx = 0;
+  monster.lastTargetKey = tc.key;
+  return true;
+}
+
+function followPath(dt, speed) {
+  if (!monster.path.length || monster.pathIdx >= monster.path.length) return false;
+
+  const mcx = monster.x + monster.w / 2;
+  const mcy = monster.y + monster.h / 2;
+  const wp = monster.path[monster.pathIdx];
+
+  const dx = wp.x - mcx;
+  const dy = wp.y - mcy;
+  const d = len(dx, dy);
+  if (d < 6) {
+    monster.pathIdx++;
+    return true;
+  }
+
+  const v = norm(dx, dy);
+  moveEntity(monster, v.x * speed, v.y * speed, dt);
+  return true;
+}
+
+// --- gameplay ---
 
 function shieldIsUp(now) {
   if (!player.shield.active) return false;
@@ -208,10 +380,8 @@ function shieldIsUp(now) {
 }
 
 function updatePlayer(dt, now) {
-  // shield hold
   player.shield.active = keys.has(' ');
 
-  // stamina
   const wantsSprint = keys.has('shift');
   const canSprint = wantsSprint && player.stamina > 1;
 
@@ -230,7 +400,6 @@ function updatePlayer(dt, now) {
     player.stamina = clamp(player.stamina + player.staminaRegenPerSec * dt, 0, player.staminaMax);
   }
 
-  // shield regen (only when not broken)
   if (now >= player.shield.brokenUntil && !shieldIsUp(now)) {
     player.shield.durability = clamp(player.shield.durability + player.shield.regenPerSec * dt, 0, player.shield.max);
   }
@@ -268,7 +437,7 @@ function emitConeFlames(fromX, fromY, dirX, dirY, now) {
   const speed = 520;
 
   for (let i = 0; i < count; i++) {
-    const t = (i / (count - 1)) * 2 - 1; // -1..1
+    const t = (i / (count - 1)) * 2 - 1;
     const ang = baseAng + t * (monster.coneAngle / 2);
     const jitter = (Math.random() - 0.5) * 0.10;
     const a = ang + jitter;
@@ -299,7 +468,6 @@ function updateFlames(dt, now) {
       continue;
     }
 
-    // extinguish on wall
     const fr = rect(f.x - f.r, f.y - f.r, f.r * 2, f.r * 2);
     let hitWall = false;
     for (const w of walls) {
@@ -310,7 +478,6 @@ function updateFlames(dt, now) {
       continue;
     }
 
-    // hit player
     const pr = rect(player.x, player.y, player.w, player.h);
     const hit = pointInRect(f.x, f.y, pr) || intersectsAABB(fr, pr);
     if (hit) {
@@ -337,41 +504,90 @@ function updateMonster(dt, now) {
   const mcy = monster.y + monster.h / 2;
 
   const sees = hasLineOfSight(mcx, mcy, pcx, pcy);
-
   if (sees) {
-    const toP = norm(pcx - mcx, pcy - mcy);
-    const dist = len(pcx - mcx, pcy - mcy);
-
-    // chase harder (keep a little distance so the cone matters)
-    if (dist > 110) {
-      moveEntity(monster, toP.x * monster.speedChase, toP.y * monster.speedChase, dt);
-    } else if (dist < 75) {
-      // back up a touch so you can maybe dodge
-      moveEntity(monster, -toP.x * (monster.speedChase * 0.55), -toP.y * (monster.speedChase * 0.55), dt);
-    }
-
-    // start a breath burst
-    if (now - monster.lastBreathAt >= monster.breathCooldownMs) {
-      monster.lastBreathAt = now;
-      monster.breathActiveUntil = now + monster.breathDurationMs;
-    }
-
-    // while active, emit a cone each frame
-    if (now < monster.breathActiveUntil) {
-      emitConeFlames(mcx, mcy, toP.x, toP.y, now);
-    }
-  } else {
-    if (now > monster.wander.until) pickWanderTarget(now);
-    const v = norm(monster.wander.x - mcx, monster.wander.y - mcy);
-    moveEntity(monster, v.x * monster.speedPatrol, v.y * monster.speedPatrol, dt);
+    monster.lastSeen = { x: pcx, y: pcy, at: now };
   }
 
-  // still lose if you touch the dragon
+  const toP = norm(pcx - mcx, pcy - mcy);
+  const dist = len(pcx - mcx, pcy - mcy);
+
+  // choose a target for pathing: current player if seen, else last seen briefly, else patrol
+  let target = null;
+  if (sees) target = { x: pcx, y: pcy };
+  else if (now - monster.lastSeen.at < 2500) target = { x: monster.lastSeen.x, y: monster.lastSeen.y };
+
+  if (target) {
+    // recompute path periodically or if target cell changed
+    const tc = pointToCell(target.x, target.y);
+    const shouldRepath = now >= monster.nextPathAt || monster.lastTargetKey !== tc.key;
+    if (shouldRepath) {
+      // Try for a direct move if no wall blocks line segment (cheap win)
+      const direct = hasLineOfSight(mcx, mcy, target.x, target.y);
+      if (direct) {
+        monster.path = [{ x: target.x, y: target.y }];
+        monster.pathIdx = 0;
+        monster.lastTargetKey = tc.key;
+      } else {
+        buildPathTo(target.x, target.y);
+      }
+      monster.nextPathAt = now + 220; // repath ~4-5 times/sec
+    }
+
+    // keep a little distance so the cone breath matters
+    const desired = sees ? 105 : 0;
+    if (sees && dist < 70) {
+      // back up slightly if too close
+      moveEntity(monster, -toP.x * (monster.speedChase * 0.55), -toP.y * (monster.speedChase * 0.55), dt);
+    } else if (!sees || dist > desired) {
+      // follow path (or fallback to naive chase if path fails)
+      const ok = followPath(dt, sees ? monster.speedChase : monster.speedChase * 0.9);
+      if (!ok) {
+        moveEntity(monster, toP.x * monster.speedChase, toP.y * monster.speedChase, dt);
+      }
+    }
+
+    // flame breath only when sees
+    if (sees) {
+      if (now - monster.lastBreathAt >= monster.breathCooldownMs) {
+        monster.lastBreathAt = now;
+        monster.breathActiveUntil = now + monster.breathDurationMs;
+      }
+      if (now < monster.breathActiveUntil) {
+        emitConeFlames(mcx, mcy, toP.x, toP.y, now);
+      }
+    }
+  } else {
+    // patrol
+    if (now > monster.wander.until) pickWanderTarget(now);
+
+    const v = norm(monster.wander.x - mcx, monster.wander.y - mcy);
+
+    // path to wander too, so it doesn't dumb-bump walls
+    const tc = pointToCell(monster.wander.x, monster.wander.y);
+    const shouldRepath = now >= monster.nextPathAt || monster.lastTargetKey !== tc.key;
+    if (shouldRepath) {
+      const direct = hasLineOfSight(mcx, mcy, monster.wander.x, monster.wander.y);
+      if (direct) {
+        monster.path = [{ x: monster.wander.x, y: monster.wander.y }];
+        monster.pathIdx = 0;
+        monster.lastTargetKey = tc.key;
+      } else {
+        buildPathTo(monster.wander.x, monster.wander.y);
+      }
+      monster.nextPathAt = now + 350;
+    }
+
+    const ok = followPath(dt, monster.speedPatrol);
+    if (!ok) moveEntity(monster, v.x * monster.speedPatrol, v.y * monster.speedPatrol, dt);
+  }
+
   if (intersectsAABB(player, monster)) {
     state = 'lost';
     statusEl.textContent = 'mauled (press R)';
   }
 }
+
+// --- rendering ---
 
 function drawStickFigure() {
   const x = player.x;
@@ -384,12 +600,10 @@ function drawStickFigure() {
   ctx.lineWidth = 2;
   ctx.strokeStyle = '#e9ecff';
 
-  // head
   ctx.beginPath();
   ctx.arc(cx, top + headR, headR, 0, Math.PI * 2);
   ctx.stroke();
 
-  // body
   const neckY = top + headR * 2 + 1;
   const hipY = y + player.h - 6;
   ctx.beginPath();
@@ -397,14 +611,12 @@ function drawStickFigure() {
   ctx.lineTo(cx, hipY);
   ctx.stroke();
 
-  // arms
   const armY = neckY + 7;
   ctx.beginPath();
   ctx.moveTo(cx - 7, armY);
   ctx.lineTo(cx + 7, armY);
   ctx.stroke();
 
-  // legs
   ctx.beginPath();
   ctx.moveTo(cx, hipY);
   ctx.lineTo(cx - 6, hipY + 10);
@@ -430,7 +642,6 @@ function drawShield(now) {
   ctx.arc(cx, cy, 18, 0, Math.PI * 2);
   ctx.stroke();
 
-  // durability arc
   ctx.globalAlpha = 0.9;
   ctx.strokeStyle = 'rgba(90,200,255,0.65)';
   ctx.lineWidth = 4;
@@ -448,18 +659,15 @@ function drawDragon() {
 
   ctx.save();
 
-  // body
   ctx.fillStyle = '#ff4d4d';
   ctx.beginPath();
   ctx.ellipse(cx - 2, cy + 2, 14, 9, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // head
   ctx.beginPath();
   ctx.ellipse(cx + 14, cy - 3, 7, 5, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // snout horn
   ctx.fillStyle = 'rgba(255,255,255,0.22)';
   ctx.beginPath();
   ctx.moveTo(cx + 19, cy - 9);
@@ -468,7 +676,6 @@ function drawDragon() {
   ctx.closePath();
   ctx.fill();
 
-  // wing
   ctx.fillStyle = 'rgba(255,77,77,0.78)';
   ctx.beginPath();
   ctx.moveTo(cx - 6, cy - 2);
@@ -477,7 +684,6 @@ function drawDragon() {
   ctx.closePath();
   ctx.fill();
 
-  // eye
   ctx.fillStyle = '#111';
   ctx.beginPath();
   ctx.arc(cx + 16, cy - 4, 1.6, 0, Math.PI * 2);
@@ -511,7 +717,6 @@ function drawFlames(now) {
 }
 
 function drawHUD(now) {
-  // stamina + shield meters (top-left)
   const pad = 14;
   const x = pad;
   const y = pad;
@@ -528,7 +733,6 @@ function drawHUD(now) {
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
   ctx.fillRect(x - 6, y - 6, barW + 12, 48);
 
-  // stamina
   ctx.fillStyle = 'rgba(255,255,255,0.18)';
   ctx.fillRect(x, y, barW, barH);
   ctx.fillStyle = 'rgba(90,200,255,0.9)';
@@ -537,7 +741,6 @@ function drawHUD(now) {
   ctx.font = '12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto';
   ctx.fillText('Sprint (Shift)', x, y + 22);
 
-  // shield
   const y2 = y + 26;
   ctx.fillStyle = 'rgba(255,255,255,0.18)';
   ctx.fillRect(x, y2, barW, barH);
@@ -595,17 +798,11 @@ function draw(now) {
   ctx.stroke();
   ctx.restore();
 
-  // flames
   drawFlames(now);
 
-  // player + shield
   drawStickFigure();
   drawShield(now);
-
-  // dragon
   drawDragon();
-
-  // meters
   drawHUD(now);
 
   if (state !== 'running') {
@@ -621,6 +818,48 @@ function draw(now) {
     ctx.fillText('Press R to restart', W / 2, H / 2 + 24);
     ctx.restore();
   }
+}
+
+let startTs = 0;
+let lastTs = 0;
+let elapsed = 0;
+let state = 'running';
+
+function reset() {
+  player.x = 60;
+  player.y = 60;
+  player.stamina = player.staminaMax;
+  player.shield.active = false;
+  player.shield.durability = player.shield.max;
+  player.shield.brokenUntil = 0;
+
+  monster.x = W - 110;
+  monster.y = H - 100;
+  monster.wander = { x: W / 2, y: H / 2, until: 0 };
+  monster.breathActiveUntil = 0;
+  monster.lastBreathAt = 0;
+  monster.path = [];
+  monster.pathIdx = 0;
+  monster.nextPathAt = 0;
+  monster.lastTargetKey = null;
+  monster.lastSeen = { x: W / 2, y: H / 2, at: 0 };
+
+  flames.length = 0;
+  startTs = 0;
+  lastTs = 0;
+  elapsed = 0;
+  state = 'running';
+  statusEl.textContent = 'running';
+}
+
+function moveEntity(ent, vx, vy, dt) {
+  ent.x += vx * dt;
+  ent.y += vy * dt;
+
+  for (const w of walls) resolveStaticCollision(ent, w);
+
+  ent.x = clamp(ent.x, 0, W - ent.w);
+  ent.y = clamp(ent.y, 0, H - ent.h);
 }
 
 function tick(ts) {
