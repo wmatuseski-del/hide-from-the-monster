@@ -1,8 +1,8 @@
 /*
   Hide From The Monster
   - Canvas + simple collision
-  - Monster chases if it has line-of-sight (LOS), otherwise patrols
-  - Walls block LOS (segment vs AABB)
+  - Dragon chases if it has line-of-sight (LOS), otherwise patrols
+  - Walls block LOS and flame breath
 */
 
 const canvas = document.getElementById('game');
@@ -21,7 +21,7 @@ goalEl.textContent = String(GOAL_SECONDS);
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
-  if (['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d','r'].includes(k)) {
+  if (['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d','r','shift',' '].includes(k)) {
     e.preventDefault();
   }
   keys.add(k);
@@ -56,11 +56,9 @@ function resolveStaticCollision(mover, stat) {
   const overlapY = Math.min(ay2, by2) - Math.max(ay1, by1);
 
   if (overlapX < overlapY) {
-    // push left/right
     if (ax1 < bx1) mover.x -= overlapX;
     else mover.x += overlapX;
   } else {
-    // push up/down
     if (ay1 < by1) mover.y -= overlapY;
     else mover.y += overlapY;
   }
@@ -72,7 +70,6 @@ function pointInRect(px, py, r) {
 
 // Segment vs AABB: Liang-Barsky style clipping
 function segmentIntersectsRect(x1, y1, x2, y2, r) {
-  // If either endpoint inside, it intersects
   if (pointInRect(x1, y1, r) || pointInRect(x2, y2, r)) return true;
 
   const dx = x2 - x1;
@@ -103,13 +100,11 @@ function segmentIntersectsRect(x1, y1, x2, y2, r) {
 }
 
 const walls = [
-  // outer border as thick walls
   rect(0, 0, W, 16),
   rect(0, H - 16, W, 16),
   rect(0, 0, 16, H),
   rect(W - 16, 0, 16, H),
 
-  // interior walls (feel free to tweak)
   rect(140, 80, 520, 18),
   rect(140, 80, 18, 250),
   rect(320, 160, 18, 260),
@@ -121,7 +116,6 @@ const walls = [
 ];
 
 function hasLineOfSight(ax, ay, bx, by) {
-  // If the segment between points hits any wall, LOS is blocked
   for (const w of walls) {
     if (segmentIntersectsRect(ax, ay, bx, by, w)) return false;
   }
@@ -132,36 +126,63 @@ const player = {
   x: 60,
   y: 60,
   w: 18,
-  h: 18,
-  speed: 210, // px/sec
+  h: 26,
+  speed: 210,
+  sprintMult: 1.65,
+  stamina: 100,
+  staminaMax: 100,
+  staminaDrainPerSec: 38,
+  staminaRegenPerSec: 22,
+  shield: {
+    active: false,
+    durability: 100,
+    max: 100,
+    hitCost: 26,
+    regenPerSec: 14,
+    brokenUntil: 0,
+    breakCooldownMs: 2400,
+  },
 };
 
 const monster = {
-  x: W - 90,
-  y: H - 90,
+  x: W - 110,
+  y: H - 100,
   w: 34,
   h: 24,
-  speedChase: 160,
-  speedPatrol: 105,
+  speedChase: 220, // faster
+  speedPatrol: 125,
   wander: { x: W / 2, y: H / 2, until: 0 },
-  breathCooldownMs: 550,
+
+  // flame breath
+  breathCooldownMs: 900,
+  breathDurationMs: 700,
+  breathActiveUntil: 0,
   lastBreathAt: 0,
+  coneAngle: Math.PI / 5.5, // total cone width ~33deg
 };
 
-const flames = []; // dragon fire projectiles
+// flame particles
+const flames = [];
 
 let startTs = 0;
 let lastTs = 0;
 let elapsed = 0;
-let state = 'running'; // running | won | lost
+let state = 'running';
 
 function reset() {
   player.x = 60;
   player.y = 60;
+  player.stamina = player.staminaMax;
+  player.shield.active = false;
+  player.shield.durability = player.shield.max;
+  player.shield.brokenUntil = 0;
+
   monster.x = W - 110;
   monster.y = H - 100;
   monster.wander = { x: W / 2, y: H / 2, until: 0 };
+  monster.breathActiveUntil = 0;
   monster.lastBreathAt = 0;
+
   flames.length = 0;
   startTs = 0;
   lastTs = 0;
@@ -174,29 +195,53 @@ function moveEntity(ent, vx, vy, dt) {
   ent.x += vx * dt;
   ent.y += vy * dt;
 
-  // collide with walls
   for (const w of walls) resolveStaticCollision(ent, w);
 
-  // clamp within bounds just in case
   ent.x = clamp(ent.x, 0, W - ent.w);
   ent.y = clamp(ent.y, 0, H - ent.h);
 }
 
-function updatePlayer(dt) {
+function shieldIsUp(now) {
+  if (!player.shield.active) return false;
+  if (now < player.shield.brokenUntil) return false;
+  return player.shield.durability > 0;
+}
+
+function updatePlayer(dt, now) {
+  // shield hold
+  player.shield.active = keys.has(' ');
+
+  // stamina
+  const wantsSprint = keys.has('shift');
+  const canSprint = wantsSprint && player.stamina > 1;
+
   let dx = 0, dy = 0;
   if (keys.has('arrowleft') || keys.has('a')) dx -= 1;
   if (keys.has('arrowright') || keys.has('d')) dx += 1;
   if (keys.has('arrowup') || keys.has('w')) dy -= 1;
   if (keys.has('arrowdown') || keys.has('s')) dy += 1;
 
-  if (dx || dy) {
+  const moving = !!(dx || dy);
+  let speed = player.speed;
+  if (moving && canSprint) {
+    speed *= player.sprintMult;
+    player.stamina = clamp(player.stamina - player.staminaDrainPerSec * dt, 0, player.staminaMax);
+  } else {
+    player.stamina = clamp(player.stamina + player.staminaRegenPerSec * dt, 0, player.staminaMax);
+  }
+
+  // shield regen (only when not broken)
+  if (now >= player.shield.brokenUntil && !shieldIsUp(now)) {
+    player.shield.durability = clamp(player.shield.durability + player.shield.regenPerSec * dt, 0, player.shield.max);
+  }
+
+  if (moving) {
     const n = norm(dx, dy);
-    moveEntity(player, n.x * player.speed, n.y * player.speed, dt);
+    moveEntity(player, n.x * speed, n.y * speed, dt);
   }
 }
 
 function pickWanderTarget(now) {
-  // choose a random point not inside walls
   for (let i = 0; i < 40; i++) {
     const x = 40 + Math.random() * (W - 80);
     const y = 40 + Math.random() * (H - 80);
@@ -217,18 +262,30 @@ function pickWanderTarget(now) {
   monster.wander.until = now + 1000;
 }
 
-function shootFlame(fromX, fromY, toX, toY, now) {
-  const v = norm(toX - fromX, toY - fromY);
-  const speed = 420;
-  flames.push({
-    x: fromX + v.x * 18,
-    y: fromY + v.y * 18,
-    vx: v.x * speed,
-    vy: v.y * speed,
-    r: 6,
-    bornAt: now,
-    ttlMs: 1400,
-  });
+function emitConeFlames(fromX, fromY, dirX, dirY, now) {
+  const baseAng = Math.atan2(dirY, dirX);
+  const count = 9;
+  const speed = 520;
+
+  for (let i = 0; i < count; i++) {
+    const t = (i / (count - 1)) * 2 - 1; // -1..1
+    const ang = baseAng + t * (monster.coneAngle / 2);
+    const jitter = (Math.random() - 0.5) * 0.10;
+    const a = ang + jitter;
+
+    const vx = Math.cos(a) * speed * (0.75 + Math.random() * 0.35);
+    const vy = Math.sin(a) * speed * (0.75 + Math.random() * 0.35);
+
+    flames.push({
+      x: fromX + Math.cos(a) * 22,
+      y: fromY + Math.sin(a) * 22,
+      vx,
+      vy,
+      r: 4.5 + Math.random() * 2.5,
+      bornAt: now,
+      ttlMs: 520 + Math.random() * 260,
+    });
+  }
 }
 
 function updateFlames(dt, now) {
@@ -237,13 +294,12 @@ function updateFlames(dt, now) {
     f.x += f.vx * dt;
     f.y += f.vy * dt;
 
-    // expire
     if (now - f.bornAt > f.ttlMs) {
       flames.splice(i, 1);
       continue;
     }
 
-    // hit wall → extinguish
+    // extinguish on wall
     const fr = rect(f.x - f.r, f.y - f.r, f.r * 2, f.r * 2);
     let hitWall = false;
     for (const w of walls) {
@@ -256,7 +312,17 @@ function updateFlames(dt, now) {
 
     // hit player
     const pr = rect(player.x, player.y, player.w, player.h);
-    if (pointInRect(f.x, f.y, pr) || intersectsAABB(fr, pr)) {
+    const hit = pointInRect(f.x, f.y, pr) || intersectsAABB(fr, pr);
+    if (hit) {
+      if (shieldIsUp(now)) {
+        player.shield.durability = clamp(player.shield.durability - player.shield.hitCost, 0, player.shield.max);
+        if (player.shield.durability <= 0.001) {
+          player.shield.brokenUntil = now + player.shield.breakCooldownMs;
+        }
+        flames.splice(i, 1);
+        continue;
+      }
+
       state = 'lost';
       statusEl.textContent = 'burned (press R)';
       flames.splice(i, 1);
@@ -273,16 +339,26 @@ function updateMonster(dt, now) {
   const sees = hasLineOfSight(mcx, mcy, pcx, pcy);
 
   if (sees) {
-    // keep some distance; the dragon attacks with flames
+    const toP = norm(pcx - mcx, pcy - mcy);
     const dist = len(pcx - mcx, pcy - mcy);
-    if (dist > 120) {
-      const v = norm(pcx - mcx, pcy - mcy);
-      moveEntity(monster, v.x * monster.speedChase, v.y * monster.speedChase, dt);
+
+    // chase harder (keep a little distance so the cone matters)
+    if (dist > 110) {
+      moveEntity(monster, toP.x * monster.speedChase, toP.y * monster.speedChase, dt);
+    } else if (dist < 75) {
+      // back up a touch so you can maybe dodge
+      moveEntity(monster, -toP.x * (monster.speedChase * 0.55), -toP.y * (monster.speedChase * 0.55), dt);
     }
 
+    // start a breath burst
     if (now - monster.lastBreathAt >= monster.breathCooldownMs) {
       monster.lastBreathAt = now;
-      shootFlame(mcx, mcy, pcx, pcy, now);
+      monster.breathActiveUntil = now + monster.breathDurationMs;
+    }
+
+    // while active, emit a cone each frame
+    if (now < monster.breathActiveUntil) {
+      emitConeFlames(mcx, mcy, toP.x, toP.y, now);
     }
   } else {
     if (now > monster.wander.until) pickWanderTarget(now);
@@ -290,15 +366,16 @@ function updateMonster(dt, now) {
     moveEntity(monster, v.x * monster.speedPatrol, v.y * monster.speedPatrol, dt);
   }
 
-  // lose condition: touching (still bad)
+  // still lose if you touch the dragon
   if (intersectsAABB(player, monster)) {
     state = 'lost';
     statusEl.textContent = 'mauled (press R)';
   }
 }
 
-function drawStickFigure(x, y) {
-  // stick figure centered in player rect
+function drawStickFigure() {
+  const x = player.x;
+  const y = player.y;
   const cx = x + player.w / 2;
   const top = y + 2;
   const headR = 5;
@@ -314,14 +391,14 @@ function drawStickFigure(x, y) {
 
   // body
   const neckY = top + headR * 2 + 1;
-  const hipY = y + player.h - 3;
+  const hipY = y + player.h - 6;
   ctx.beginPath();
   ctx.moveTo(cx, neckY);
   ctx.lineTo(cx, hipY);
   ctx.stroke();
 
   // arms
-  const armY = neckY + 6;
+  const armY = neckY + 7;
   ctx.beginPath();
   ctx.moveTo(cx - 7, armY);
   ctx.lineTo(cx + 7, armY);
@@ -330,16 +407,42 @@ function drawStickFigure(x, y) {
   // legs
   ctx.beginPath();
   ctx.moveTo(cx, hipY);
-  ctx.lineTo(cx - 6, hipY + 9);
+  ctx.lineTo(cx - 6, hipY + 10);
   ctx.moveTo(cx, hipY);
-  ctx.lineTo(cx + 6, hipY + 9);
+  ctx.lineTo(cx + 6, hipY + 10);
   ctx.stroke();
 
   ctx.restore();
 }
 
-function drawDragon(x, y) {
-  // simple dragon silhouette within monster rect
+function drawShield(now) {
+  if (!shieldIsUp(now)) return;
+
+  const cx = player.x + player.w / 2;
+  const cy = player.y + player.h / 2 + 2;
+  const pct = player.shield.durability / player.shield.max;
+
+  ctx.save();
+  ctx.globalAlpha = 0.35 + pct * 0.35;
+  ctx.strokeStyle = 'rgba(90,200,255,0.95)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // durability arc
+  ctx.globalAlpha = 0.9;
+  ctx.strokeStyle = 'rgba(90,200,255,0.65)';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 18, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * pct);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDragon() {
+  const x = monster.x;
+  const y = monster.y;
   const cx = x + monster.w / 2;
   const cy = y + monster.h / 2;
 
@@ -348,7 +451,7 @@ function drawDragon(x, y) {
   // body
   ctx.fillStyle = '#ff4d4d';
   ctx.beginPath();
-  ctx.ellipse(cx, cy + 2, 14, 9, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx - 2, cy + 2, 14, 9, 0, 0, Math.PI * 2);
   ctx.fill();
 
   // head
@@ -356,12 +459,21 @@ function drawDragon(x, y) {
   ctx.ellipse(cx + 14, cy - 3, 7, 5, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // wing
-  ctx.fillStyle = 'rgba(255,77,77,0.8)';
+  // snout horn
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
   ctx.beginPath();
-  ctx.moveTo(cx - 4, cy - 2);
-  ctx.lineTo(cx - 18, cy - 16);
-  ctx.lineTo(cx - 14, cy + 4);
+  ctx.moveTo(cx + 19, cy - 9);
+  ctx.lineTo(cx + 27, cy - 6);
+  ctx.lineTo(cx + 19, cy - 4);
+  ctx.closePath();
+  ctx.fill();
+
+  // wing
+  ctx.fillStyle = 'rgba(255,77,77,0.78)';
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy - 2);
+  ctx.lineTo(cx - 22, cy - 18);
+  ctx.lineTo(cx - 16, cy + 5);
   ctx.closePath();
   ctx.fill();
 
@@ -371,35 +483,70 @@ function drawDragon(x, y) {
   ctx.arc(cx + 16, cy - 4, 1.6, 0, Math.PI * 2);
   ctx.fill();
 
-  // outline
-  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(x + 0.5, y + 0.5, monster.w - 1, monster.h - 1);
-
   ctx.restore();
 }
 
 function drawFlames(now) {
   for (const f of flames) {
     const age = clamp((now - f.bornAt) / f.ttlMs, 0, 1);
-    const r = f.r * (1.15 - age * 0.35);
+    const r = f.r * (1.25 - age * 0.55);
 
     ctx.save();
-    const grad = ctx.createRadialGradient(f.x, f.y, 1, f.x, f.y, r * 2.2);
-    grad.addColorStop(0, 'rgba(255,255,200,0.95)');
-    grad.addColorStop(0.35, 'rgba(255,170,0,0.85)');
+    const grad = ctx.createRadialGradient(f.x, f.y, 1, f.x, f.y, r * 3.0);
+    grad.addColorStop(0, 'rgba(255,255,210,0.95)');
+    grad.addColorStop(0.25, 'rgba(255,195,30,0.85)');
+    grad.addColorStop(0.55, 'rgba(255,90,0,0.55)');
     grad.addColorStop(1, 'rgba(255,60,0,0.0)');
     ctx.fillStyle = grad;
     ctx.beginPath();
-    ctx.arc(f.x, f.y, r * 2.2, 0, Math.PI * 2);
+    ctx.arc(f.x, f.y, r * 3.0, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.fillStyle = 'rgba(255,120,0,0.9)';
+    ctx.fillStyle = 'rgba(255,120,0,0.85)';
     ctx.beginPath();
     ctx.arc(f.x, f.y, r, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
+}
+
+function drawHUD(now) {
+  // stamina + shield meters (top-left)
+  const pad = 14;
+  const x = pad;
+  const y = pad;
+
+  const barW = 170;
+  const barH = 8;
+
+  const staminaPct = player.stamina / player.staminaMax;
+  const shieldPct = player.shield.durability / player.shield.max;
+  const shieldBroken = now < player.shield.brokenUntil;
+
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(x - 6, y - 6, barW + 12, 48);
+
+  // stamina
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fillRect(x, y, barW, barH);
+  ctx.fillStyle = 'rgba(90,200,255,0.9)';
+  ctx.fillRect(x, y, barW * staminaPct, barH);
+  ctx.fillStyle = 'rgba(233,236,255,0.85)';
+  ctx.font = '12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto';
+  ctx.fillText('Sprint (Shift)', x, y + 22);
+
+  // shield
+  const y2 = y + 26;
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fillRect(x, y2, barW, barH);
+  ctx.fillStyle = shieldBroken ? 'rgba(255,100,100,0.85)' : 'rgba(120,255,200,0.85)';
+  ctx.fillRect(x, y2, barW * shieldPct, barH);
+  ctx.fillStyle = 'rgba(233,236,255,0.85)';
+  ctx.fillText(shieldBroken ? 'Shield (Space) BROKEN' : 'Shield (Space)', x, y2 + 22);
+
+  ctx.restore();
 }
 
 function draw(now) {
@@ -431,7 +578,7 @@ function draw(now) {
     ctx.strokeRect(w.x + 0.5, w.y + 0.5, w.w - 1, w.h - 1);
   }
 
-  // LOS indicator (subtle)
+  // LOS indicator
   const pcx = player.x + player.w / 2;
   const pcy = player.y + player.h / 2;
   const mcx = monster.x + monster.w / 2;
@@ -439,7 +586,7 @@ function draw(now) {
   const sees = hasLineOfSight(mcx, mcy, pcx, pcy);
 
   ctx.save();
-  ctx.globalAlpha = sees ? 0.22 : 0.08;
+  ctx.globalAlpha = sees ? 0.20 : 0.07;
   ctx.strokeStyle = sees ? '#ff8a3d' : '#9aa6ff';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -451,13 +598,16 @@ function draw(now) {
   // flames
   drawFlames(now);
 
-  // player (stick figure)
-  drawStickFigure(player.x, player.y);
+  // player + shield
+  drawStickFigure();
+  drawShield(now);
 
-  // monster (dragon)
-  drawDragon(monster.x, monster.y);
+  // dragon
+  drawDragon();
 
-  // text overlays
+  // meters
+  drawHUD(now);
+
   if (state !== 'running') {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -483,7 +633,7 @@ function tick(ts) {
     elapsed = (ts - startTs) / 1000;
     timeEl.textContent = elapsed.toFixed(1);
 
-    updatePlayer(dt);
+    updatePlayer(dt, ts);
     updateMonster(dt, ts);
     updateFlames(dt, ts);
 

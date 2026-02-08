@@ -9,6 +9,8 @@ Just open `index.html` in your browser.
 ## Controls
 
 - Move: Arrow keys or WASD
+- Sprint: Shift (uses stamina)
+- Shield: Hold Space (limited durability)
 - Restart: R
 
 ## Rules
